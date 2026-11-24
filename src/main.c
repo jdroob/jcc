@@ -101,7 +101,7 @@ TokenList_t *createTokenList(void) {
 	return list;
 }
 
-void deleteList(void) {
+void deleteTokenList(void) {
 	free(scanner.tokens->tokens);
 	free(scanner.tokens);
 }
@@ -148,8 +148,9 @@ void setup(const char *src) {
 }
 
 void teardown(void) {
-	deleteList();
+	deleteTokenList();
 	scanner.start = scanner.curr = NULL;
+	// deleteStmtLIst(); // <- need to fully delete each stmt including funcDecls that contain paramLists
 }
 
 // --- cursor movement ---
@@ -436,6 +437,7 @@ void printTokens(void) {
 	}
 }
 
+bool parse(void);
 bool lex(const char *src) {
 	setup(src);
 	while (!isAtEnd()) {
@@ -506,6 +508,7 @@ void compile2(const char *pp, char *assembly) {
 	// the real compiler
 	char *src = readSource(pp);
 	bool lexrc = lex(src);
+	bool parserc = parse();
 	free(src);
 	teardown();
 	if (ONLY_LEX) {
@@ -563,6 +566,12 @@ typedef struct {
 	Token_t identifier;
 } Param_t;
 
+typedef struct {
+	ssize_t len;
+	ssize_t cap;
+	Param_t *params;
+} ParamList_t;
+
 typedef enum {
 	NUMBER,
 	STRING,
@@ -612,8 +621,9 @@ typedef struct {
 typedef struct {
 	Stmt_t stmt;
 	Type_e returnType;
-	Param_t *params;
-	StmtList_t body;
+	Token_t name;
+	ParamList_t *params;
+	StmtList_t *body;
 } FuncDecl_t;
 
 typedef struct {
@@ -623,6 +633,39 @@ typedef struct {
 } Parser_t;
 
 Parser_t parser;
+
+ParamList_t *createParamList(void) {
+	ParamList_t *list = (ParamList_t *)malloc(sizeof(ParamList_t));
+	if (!list) {
+		perror(": createParamList::malloc");
+		exit(EXIT_FAILURE);
+	}
+	list->len = -1;
+	list->cap = -1;
+	list->params = NULL;
+	return list;
+}
+
+bool addParam(Param_t param, FuncDecl_t *funcDecl) {
+	if (funcDecl->params->len >= funcDecl->params->cap) {
+		ssize_t oldCap = funcDecl->params->cap;
+		if (oldCap == -1) {
+			funcDecl->params->cap = 8;
+			funcDecl->params->len = 0;
+		} else {
+			funcDecl->params->cap *= 2;
+		}
+		Param_t *list = (Param_t *)realloc(funcDecl->params->params, (size_t)funcDecl->params->cap * sizeof(Param_t));
+		if (!list) {
+			perror(": addParam::realloc");
+			// exit(EXIT_FAILURE);
+			return false;
+		}
+		funcDecl->params->params = list;
+	}
+	funcDecl->params->params[funcDecl->params->len++] = param;
+	return true;
+}
 
 StmtList_t *createStmtList(void) {
 	StmtList_t *list = (StmtList_t *)malloc(sizeof(StmtList_t));
@@ -665,21 +708,62 @@ void initParser(void) {
 FuncDecl_t *newFuncDecl(void) {
 	FuncDecl_t *funcDecl = (FuncDecl_t *)malloc(sizeof(FuncDecl_t));
 	funcDecl->stmt.type = FUNC_DECL;
+	funcDecl->params = createParamList();
 	return funcDecl;
 }
+
+bool parserCheck(TokenType_e);
+void parserConsumeType(void);
+void parserConsume(TokenType_e type);
+void params(FuncDecl_t *funcDecl);
 void function(void) {
 	FuncDecl_t *funcDecl = newFuncDecl();
 	// TODO: recursive descent logic here :)
+	if (parserCheck(TOKEN_TYPE_INT) || parserCheck(TOKEN_TYPE_VOID)) {
+		funcDecl->returnType = parserCheck(TOKEN_TYPE_INT) ? INT : VOID;
+	}
+	parserConsumeType();
+	if (parserCheck(TOKEN_IDENTIFIER)) {
+		funcDecl->name = *parser.curr;
+	}
+	parserConsume(TOKEN_IDENTIFIER);
+	parserConsume(TOKEN_OPEN_PAREN);
+	params(funcDecl);
+	parserConsume(TOKEN_OPEN_BRACE);
+	// body(funcDecl->body);
+	parserConsume(TOKEN_CLOSE_BRACE);
+
 	addStmt(&funcDecl->stmt);
 }
 
+void params(FuncDecl_t *funcDecl) {
+	while (!parserCheck(TOKEN_CLOSE_BRACE)) {
+		Param_t param;
+		if (parserCheck(TOKEN_TYPE_INT) || parserCheck(TOKEN_TYPE_VOID)) {
+			param.type = parserCheck(TOKEN_TYPE_INT) ? INT : VOID;
+		}
+		parserConsumeType();
+		if (parserCheck(TOKEN_IDENTIFIER)) {
+			param.identifier = *parser.curr;	
+		}
+		parserConsume(TOKEN_IDENTIFIER);
+		addParam(param, funcDecl);
+		if (parserCheck(TOKEN_CLOSE_PAREN)) {
+			break;
+		}
+		parserConsume(TOKEN_COMMA);
+	}
+}
+
 bool parserCheck(TokenType_e type);
-void top(void) {
+bool parse(void) {
+	initParser();
 	// <program> ::= <function>* ;
 	if (parserCheck(TOKEN_TYPE_INT) || parserCheck(TOKEN_TYPE_VOID)) {
 		function();
 	}
 	// TODO: other top-level productions need to be added
+	return true;
 }
 
 bool parserCheck(TokenType_e type) {
@@ -687,6 +771,38 @@ bool parserCheck(TokenType_e type) {
 		return true;
 	}
 	return false;
+}
+
+#define COMPTIME_ERROR(errType, fmt, ...) { \
+	fprintf(stderr, "%s: " fmt "\n", errType, __VA_ARGS__); \
+	exit(EXIT_FAILURE); \
+}
+
+bool parserIsAtEnd(void) {
+	return parser.curr->type == TOKEN_TERMINAL;
+}
+
+void parserBump(void) {
+	if (!parserIsAtEnd()) {
+		parser.start++;
+		parser.curr++;
+	}
+}
+
+void parserConsume(TokenType_e type) {
+	if (parserCheck(type)) {
+		parserBump();
+	} else {
+		COMPTIME_ERROR("PARSER", "Expected token type %d but received %d", type, parser.curr->type);
+	}
+}
+
+void parserConsumeType(void) {
+	if (parserCheck(TOKEN_TYPE_INT) || parserCheck(TOKEN_TYPE_VOID)) {
+		parserBump();
+	} else {
+		COMPTIME_ERROR("PARSER", "Expected 'INT' or 'VOID' type token but received %d", parser.curr->type);
+	}
 }
 
 // ======
