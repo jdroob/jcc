@@ -150,7 +150,7 @@ void setup(const char *src) {
 void teardown(void) {
 	deleteTokenList();
 	scanner.start = scanner.curr = NULL;
-	// deleteStmtLIst(); // <- need to fully delete each stmt including funcDecls that contain paramLists
+	// deleteStmtLIst(); // <- need to fully delete each stmt including funcDefs that contain paramLists
 }
 
 // --- cursor movement ---
@@ -545,12 +545,13 @@ void assemble(const char *assembly, char *binary) {
 
 		<program> ::= <function>* | <struct>* | <enum>* | <varDecl>* ;
 		<function> ::= <type> <identifier> "(" <params> ")" "{" <statement> "}" ;
+		<globalDecl> ::= <type> <identifier> ["=" <expression> ";"] ;
 		<type> ::= "int" | "void" ;
 		<identifer> ::= IDENTIFIER ;
 		<params> ::= (<type> <identifier> ",")* (<type> <identifier>)? ;
-		<statement> ::= returnStmt | ifStmt | blockStmt ;
+		<statement> ::= returnStmt | ifStmt | varDecl | blockStmt ;
 		<blockStmt> ::= (<statement>)+ ;
-		<returnStmt> ::= "return" <expr> ;
+		<returnStmt> ::= "return" <expr> ";" ;
 		<ifStmt> ::= "if" "(" <expr> ")" "{" <statement> "}" ["else" "{" <statement> "}"] ;
 		<expr> ::= NUMBER | STRING | BINOP | UNOP ;
 
@@ -579,9 +580,17 @@ typedef enum {
 	UNOP
 } ExprType_e;
 
-typedef struct {
+typedef struct Expr_t Expr_t;
+typedef union {
+	double num;
+	char *str;
+	Expr_t *expr;
+} Value_t;
+
+struct Expr_t {
 	ExprType_e type;
-} Expr_t;
+	Value_t val;
+};
 
 typedef enum {
 	FUNC_DECL,
@@ -624,7 +633,7 @@ typedef struct {
 	Token_t name;
 	ParamList_t *params;
 	StmtList_t *body;
-} FuncDecl_t;
+} FuncDef_t;
 
 typedef struct {
 	const Token_t *start;
@@ -646,24 +655,24 @@ ParamList_t *createParamList(void) {
 	return list;
 }
 
-bool addParam(Param_t param, FuncDecl_t *funcDecl) {
-	if (funcDecl->params->len >= funcDecl->params->cap) {
-		ssize_t oldCap = funcDecl->params->cap;
+bool addParam(Param_t param, FuncDef_t *funcDef) {
+	if (funcDef->params->len >= funcDef->params->cap) {
+		ssize_t oldCap = funcDef->params->cap;
 		if (oldCap == -1) {
-			funcDecl->params->cap = 8;
-			funcDecl->params->len = 0;
+			funcDef->params->cap = 8;
+			funcDef->params->len = 0;
 		} else {
-			funcDecl->params->cap *= 2;
+			funcDef->params->cap *= 2;
 		}
-		Param_t *list = (Param_t *)realloc(funcDecl->params->params, (size_t)funcDecl->params->cap * sizeof(Param_t));
+		Param_t *list = (Param_t *)realloc(funcDef->params->params, (size_t)funcDef->params->cap * sizeof(Param_t));
 		if (!list) {
 			perror(": addParam::realloc");
 			// exit(EXIT_FAILURE);
 			return false;
 		}
-		funcDecl->params->params = list;
+		funcDef->params->params = list;
 	}
-	funcDecl->params->params[funcDecl->params->len++] = param;
+	funcDef->params->params[funcDef->params->len++] = param;
 	return true;
 }
 
@@ -679,24 +688,24 @@ StmtList_t *createStmtList(void) {
 	return list;
 }
 
-bool addStmt(Stmt_t *stmt) {
-	if (parser.stmts->len >= parser.stmts->cap) {
-		ssize_t oldCap = parser.stmts->cap;
+bool addStmt(StmtList_t *list, Stmt_t *stmt) {
+	if (list->len >= list->cap) {
+		ssize_t oldCap = list->cap;
 		if (oldCap == -1) {
-			parser.stmts->cap = 8;
-			parser.stmts->len = 0;
+			list->cap = 8;
+			list->len = 0;
 		} else {
-			parser.stmts->cap *= 2;
+			list->cap *= 2;
 		}
-		Stmt_t **list = (Stmt_t **)realloc(parser.stmts->stmts, (size_t)parser.stmts->cap * sizeof(Stmt_t *));
-		if (!list) {
+		Stmt_t **stmts = (Stmt_t **)realloc(list->stmts, (size_t)list->cap * sizeof(Stmt_t *));
+		if (!stmts) {
 			perror(": addStmt::realloc");
 			// exit(EXIT_FAILURE);
 			return false;
 		}
-		parser.stmts->stmts = list;
+		list->stmts = stmts;
 	}
-	parser.stmts->stmts[parser.stmts->len++] = stmt;
+	list->stmts[list->len++] = stmt;
 	return true;
 }
 
@@ -705,39 +714,96 @@ void initParser(void) {
 	parser.stmts = createStmtList();
 }
 
-FuncDecl_t *newFuncDecl(void) {
-	FuncDecl_t *funcDecl = (FuncDecl_t *)malloc(sizeof(FuncDecl_t));
-	funcDecl->stmt.type = FUNC_DECL;
-	funcDecl->params = createParamList();
-	return funcDecl;
+FuncDef_t *newFuncDef(void) {
+	FuncDef_t *funcDef = (FuncDef_t *)malloc(sizeof(FuncDef_t));
+	funcDef->stmt.type = FUNC_DECL;
+	funcDef->params = createParamList();
+	return funcDef;
+}
+
+ReturnStmt_t *newReturnStmt(void) {
+	ReturnStmt_t *retStmt = (ReturnStmt_t *)malloc(sizeof(ReturnStmt_t));
+	retStmt->stmt.type = RETURN;
+	return retStmt;	
 }
 
 bool parserCheck(TokenType_e);
 void parserConsumeType(void);
 void parserConsume(TokenType_e type);
-void params(FuncDecl_t *funcDecl);
+void params(FuncDef_t *funcDef);
+void body(StmtList_t *stmts);
 void function(void) {
-	FuncDecl_t *funcDecl = newFuncDecl();
-	// TODO: recursive descent logic here :)
+	FuncDef_t *funcDef = newFuncDef();
 	if (parserCheck(TOKEN_TYPE_INT) || parserCheck(TOKEN_TYPE_VOID)) {
-		funcDecl->returnType = parserCheck(TOKEN_TYPE_INT) ? INT : VOID;
+		funcDef->returnType = parserCheck(TOKEN_TYPE_INT) ? INT : VOID;
 	}
 	parserConsumeType();
 	if (parserCheck(TOKEN_IDENTIFIER)) {
-		funcDecl->name = *parser.curr;
+		funcDef->name = *parser.curr;
 	}
 	parserConsume(TOKEN_IDENTIFIER);
 	parserConsume(TOKEN_OPEN_PAREN);
-	params(funcDecl);
+	params(funcDef);
+	parserConsume(TOKEN_CLOSE_PAREN);
 	parserConsume(TOKEN_OPEN_BRACE);
-	// body(funcDecl->body);
+	funcDef->body = createStmtList();
+	body(funcDef->body);
 	parserConsume(TOKEN_CLOSE_BRACE);
 
-	addStmt(&funcDecl->stmt);
+	addStmt(parser.stmts, &funcDef->stmt);
 }
 
-void params(FuncDecl_t *funcDecl) {
+void block(StmtList_t *stmts);
+void body(StmtList_t *stmts) {
+	block(stmts);
+}
+
+Expr_t expression(void);
+void varDecl(void);
+void block(StmtList_t *stmts) {
 	while (!parserCheck(TOKEN_CLOSE_BRACE)) {
+		if (parserCheck(TOKEN_OPEN_BRACE)) {
+			parserConsume(TOKEN_OPEN_BRACE);
+			block(stmts);
+		} else if (parserCheck(TOKEN_RETURN)) {
+			ReturnStmt_t *stmt = newReturnStmt();
+			parserConsume(TOKEN_RETURN);
+			stmt->expr = expression();
+			parserConsume(TOKEN_SEMICOLON);
+			addStmt(stmts, &stmt->stmt);
+		} else if (parserCheck(TOKEN_TYPE_INT) || parserCheck(TOKEN_TYPE_VOID)) {
+			// TODO: implement me :)
+			varDecl();
+		}
+		else if (parserCheck(TOKEN_IF)) {
+			// todo: implement me :)
+		}
+	}
+}
+
+void varDecl(void) {
+	// TODO: Implement me :)
+}
+
+double makeDouble(void);
+Expr_t expression(void) {
+	Expr_t expr;
+	if (parserCheck(TOKEN_NUM)) {
+		expr.val.num = makeDouble();
+		parserConsume(TOKEN_NUM);
+	}
+	return expr;
+}
+
+double makeDouble(void) {
+	char buffer[parser.curr->len + 1];
+	buffer[parser.curr->len] = '\0';
+	strncpy(buffer, parser.curr->start, (size_t)parser.curr->len);
+	return strtod(buffer, NULL);
+}
+
+void params(FuncDef_t *funcDef) {
+	while (!parserCheck(TOKEN_CLOSE_PAREN)) {
 		Param_t param;
 		if (parserCheck(TOKEN_TYPE_INT) || parserCheck(TOKEN_TYPE_VOID)) {
 			param.type = parserCheck(TOKEN_TYPE_INT) ? INT : VOID;
@@ -747,7 +813,7 @@ void params(FuncDecl_t *funcDecl) {
 			param.identifier = *parser.curr;	
 		}
 		parserConsume(TOKEN_IDENTIFIER);
-		addParam(param, funcDecl);
+		addParam(param, funcDef);
 		if (parserCheck(TOKEN_CLOSE_PAREN)) {
 			break;
 		}
@@ -758,11 +824,14 @@ void params(FuncDecl_t *funcDecl) {
 bool parserCheck(TokenType_e type);
 bool parse(void) {
 	initParser();
-	// <program> ::= <function>* ;
-	if (parserCheck(TOKEN_TYPE_INT) || parserCheck(TOKEN_TYPE_VOID)) {
-		function();
+
+	while (!parserCheck(TOKEN_TERMINAL)) {
+		// <program> ::= <function>* ;
+		if (parserCheck(TOKEN_TYPE_INT) || parserCheck(TOKEN_TYPE_VOID)) {
+			function();
+		}
+		// TODO: other top-level productions need to be added
 	}
-	// TODO: other top-level productions need to be added
 	return true;
 }
 
